@@ -1,7 +1,7 @@
 #!/bin/bash
 
-. functions.sh
-. constants.sh
+. ./functions.sh
+. ./constants.sh
 
 # Configurações iniciais
 echo "Carregando o layout de teclado brasileiro..."
@@ -16,26 +16,66 @@ else
 	exit 1
 fi
 
-# Conexão com a internet
-if [ ! -f /sys/class/net/enp0s3 ]; then
-	echo "Conexão cabeada não encontrada. Conecte-se a uma rede Wi-Fi."
-	wifi-menu
-	check_success
-fi
-
+# Teste de conexão com a internet
 echo "Verificando conexão com a internet..."
-ping -c 3 google.com
-check_success
+if ping -c 1 archlinux.org &> /dev/null; then
+    echo "Conexão com a internet estabelecida."
+else
+    echo "Conexão com a internet falhou. Conecte-se a uma rede."
+	echo "Iniciando iwctl..."
+    iwctl
+    check_success
+    # Verifique novamente após a tentativa de conexão Wi-Fi
+    if ping -c 1 archlinux.org &> /dev/null; then
+        echo "Conexão com a internet estabelecida após conectar ao Wi-Fi."
+    else
+        echo "Falha ao conectar à internet. Verifique a conexão e tente novamente."
+        exit 1
+    fi
+fi
 
 # Particionamento do disco
 echo "Iniciando particionamento do disco..."
 choose_disk
 
-read -r "Deseja utilizar LVM on LUKS? (s/n): " use_luks
+read -p "Deseja utilizar LVM on LUKS? (s/n): " use_luks
+
+# Salvar a informação sobre utilizar LVM on LUKS
+# para uso posterior no script chroot
+echo "use_luks=$use_luks" >> ./constants.sh
+echo "disco_escolhido=$disco_escolhido" >> ./constants.sh
 
 if [ "$use_luks" = "s" ]; then
 	partition_disk
 
+	# Verifique se o disco escolhido está sendo usado
+	echo "Verificando volumes montados e swap ativos..."
+
+	# Desativar swap
+	# Capturar o caminho da partição swap ativa
+	swap_device=$(swapon --show | grep -E '/dev/' | awk '{print $1}')
+
+	# Se houver uma partição swap ativa, desativá-la
+	if [ -n "$swap_device" ]; then
+		echo "Desativando swap em $swap_device..."
+		swapoff "$swap_device"
+		check_success
+	fi
+
+	# Desmontar partições montadas
+	if mount | grep -q "/mnt"; then
+		echo "Desmontando partições..."
+		umount -R /mnt
+		check_success
+	fi
+
+	# Fechar volume LUKS/LVM se estiver aberto
+	if cryptsetup status cryptlvm >/dev/null 2>&1; then
+		echo "Fechando volume criptografado existente..."
+		vgchange -a n vg0  # Desativa o volume group
+		cryptsetup close cryptlvm
+		check_success
+	fi
 	echo "Formatando a partição de boot..."
 	mkfs.fat -F32 /dev/"${disco_escolhido}1"
 	check_success
@@ -90,109 +130,34 @@ timedatectl set-ntp true
 check_success
 
 # Instalação do sistema base
-read -r "Você usa processador AMD ou Intel? (a/i): " user_processor
+read -p "Você usa processador AMD ou Intel? (a/i): " user_processor
 
 while [ "$user_processor" != "a" ] && [ "$user_processor" != "i" ]; do
 	echo "Opção inválida. Tente novamente."
-	read -r "Você usa processador AMD ou Intel? (a/i): " user_processor
+	read -p "Você usa processador AMD ou Intel? (a/i): " user_processor
 done
 
 if [ "$user_processor" = "a" ]; then
-	base_system_packages="${base_system_packages} amd-ucode"
+	base_system_packages="$base_system_packages amd-ucode"
 elif [ "$user_processor" = "i" ]; then
-	base_system_packages="${base_system_packages} intel-ucode"
+	base_system_packages="$base_system_packages intel-ucode"
 fi
 
 echo "Instalando o sistema base..."
-pacstrap /mnt "${base_system_packages}"
+pacstrap /mnt $base_system_packages
 check_success
 
 echo "Gerando arquivo fstab..."
 genfstab -U -p /mnt >>/mnt/etc/fstab
 check_success
 
+echo "Copiando o script de comandos para o ambiente chroot..."
+cp chroot-commands.sh functions.sh constants.sh /mnt/root
+chmod +x /mnt/root/chroot-commands.sh /mnt/root/functions.sh /mnt/root/constants.sh
+
 echo "Entrando no sistema instalado..."
-arch-chroot /mnt
+arch-chroot /mnt /root/chroot-commands.sh
 
-echo "Configurando fuso horário..."
-ln -sf /usr/share/zoneinfo/America/Sao_Paulo /etc/localtime
-check_success
+echo "Saindo do chroot e limpando..."
+rm /mnt/root/chroot-commands.sh /mnt/root/functions.sh /mnt/root/constants.sh
 
-echo "Gerando o arquivo de localidade..."
-echo "Descomentando en_US.UTF-8 em /etc/locale.gen..."
-sed -i 's/#en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
-locale-gen
-check_success
-
-echo "Configurando variáveis de idioma e layout de teclado..."
-echo "LANG=en_US.UTF-8" >/etc/locale.conf
-echo "KEYMAP=br-abnt2" >/etc/vconsole.conf
-check_success
-
-echo "Configurando hostname..."
-read -r "Digite o nome do seu computador: " hostname
-echo "$hostname" >/etc/hostname
-
-cat <<EOF >>/etc/hosts
-127.0.0.1         localhost.localdomain            localhost
-::1               localhost.localdomain            localhost
-127.0.1.1         $hostname.localdomain            $hostname
-EOF
-check_success
-
-echo "Configurando senha de root..."
-passwd
-check_success
-
-echo "Criando usuário..."
-
-confirm_user_name="n"
-while [ "$confirm_user_name" != "s" ]; do
-	read -r "Digite seu nome de usuário: " username
-	echo "Usuário: $username"
-	read -r "Confirma? (s/n): " confirm_user_name
-done
-
-useradd -m -g users -G wheel "$username"
-passwd "$username"
-check_success
-
-if [ "$use_luks" = "s" ]; then
-	echo "Editando /etc/mkinitcpio.conf para LVM on LUKS..."
-	sed -i 's/HOOKS=(base udev autodetect modconf block filesystems fsck)/HOOKS=(base udev autodetect keyboard keymap modconf block encrypt lvm2 filesystems fsck)/' /etc/mkinitcpio.conf
-	mkinitcpio -p linux
-	check_success
-fi
-
-echo "Instalando pacotes básicos..."
-pacman -S --noconfirm "${basic_packages}"
-check_success
-
-# TODO: Verificar necessidade, visto que o pacote mesa já é instalado
-read -r "Você usa Nvidia? (s/n): " use_nvidia
-if [ "$use_nvidia" = "s" ]; then
-	pacman -S --noconfirm nvidia
-	check_success
-fi
-
-echo "Configurando sudoers..."
-echo "$username ALL=(ALL) ALL" >>/etc/sudoers
-check_success
-
-# Configurando Bootloader
-echo "Configurando Grub..."
-grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=grub --recheck
-grub-mkconfig -o /boot/grub/grub.cfg
-check_success
-
-# Habilitar serviços de rede
-echo "Habilitando serviços de rede..."
-systemctl enable dhcpcd
-systemctl enable iwd
-systemctl enable NetworkManager
-check_success
-
-echo "Instalação concluída. Saindo do chroot..."
-exit
-umount -a
-echo "Execute 'reboot' para reiniciar o sistema"
